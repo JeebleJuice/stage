@@ -82,6 +82,13 @@ export interface RestoreRun {
   stageName: string;
   startedAt: string;
   durationMs: number;
-  status: "success" | "partial" | "failed";
+  status: "success" | "partial" | "failed" | "cancelled";
   items: RestoreItem[];
+}
+
+export interface RestoreProgress {
+  operationId: string;
+  phase: "matching" | "launching" | "waiting" | "placing" | "complete" | "cancelled";
+  item?: RestoreItem;
+  message: string;
 }

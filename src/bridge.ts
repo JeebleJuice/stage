@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { InstalledApp, RestoreRun, StageDefinition, SystemSnapshot } from "./types";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import type { InstalledApp, RestoreProgress, RestoreRun, StageDefinition, SystemSnapshot } from "./types";
 
 const STORAGE_KEY = "stage-definitions-v1";
 const RUN_KEY = "stage-runs-v1";
@@ -45,13 +46,22 @@ export async function discoverApps(): Promise<InstalledApp[]> {
   ];
 }
 
-export async function restoreStage(stage: StageDefinition): Promise<RestoreRun> {
-  if (isTauri()) return invoke("restore_stage", { stage });
+export async function restoreStage(stage: StageDefinition, operationId: string): Promise<RestoreRun> {
+  if (isTauri()) return invoke("restore_stage", { stage, operationId });
   const items = stage.resources.map((resource) => ({ resourceId: resource.id, name: resource.name, status: resource.kind === "note" ? "skipped" as const : "placed" as const, message: resource.kind === "note" ? "Note shown in Stage" : `Previewed on workspace ${resource.placement.workspace}` }));
-  const run: RestoreRun = { id: crypto.randomUUID(), stageId: stage.id, stageName: stage.name, startedAt: new Date().toISOString(), durationMs: 640, status: "success", items };
+  const run: RestoreRun = { id: operationId, stageId: stage.id, stageName: stage.name, startedAt: new Date().toISOString(), durationMs: 640, status: "success", items };
   localStorage.setItem(RUN_KEY, JSON.stringify([run, ...readLocal<RestoreRun[]>(RUN_KEY, [])].slice(0, 50)));
   await new Promise((resolve) => setTimeout(resolve, 900));
   return run;
+}
+
+export async function cancelRestore(operationId: string): Promise<void> {
+  if (isTauri()) return invoke("cancel_restore", { operationId });
+}
+
+export async function onRestoreProgress(handler: (progress: RestoreProgress) => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen<RestoreProgress>("stage://restore-progress", (event) => handler(event.payload));
 }
 
 export async function listRuns(): Promise<RestoreRun[]> {

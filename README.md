@@ -9,11 +9,11 @@ The project follows the product definition in `Stage - Persistent Hyprland Works
 - Create, edit, duplicate, delete, import, and export Stage definitions.
 - Discover installed Linux applications from standard `.desktop` entries.
 - Add applications, files, folders, URLs, terminal directories, reviewed commands, and resumption notes.
-- Capture the current Hyprland window arrangement into a safe draft without silently collecting commands or URLs.
+- Capture the current Hyprland window arrangement into a safe draft, resolve installed-application identities where possible, and avoid silently collecting commands or URLs.
 - Persist Stage definitions and restoration history in local SQLite.
 - Reuse matching open windows before launching missing resources.
 - Place windows through Hyprland dispatchers, including workspace, monitor, tiled/floating/fullscreen, pinned state, and optional floating geometry.
-- Report each reused, launched, placed, skipped, timed-out, or failed resource.
+- Stream per-resource restoration progress, support cancellation, and report each reused, launched, placed, skipped, timed-out, or failed resource.
 - Run the UI in a browser with a safe simulated adapter for interface development.
 
 Stage restores declared resources and placement. It does not claim to reconstruct arbitrary unsaved state inside another application.
@@ -65,4 +65,4 @@ The bundle configuration targets RPM and AppImage. Local application data is sto
 
 ## Matching model
 
-Stage matches existing and newly launched windows using configured class and optional title-substring rules. Captured Stages begin with the Hyprland initial window class but no launch command; review each captured resource and select its installed application or provide an explicit launch target before relying on it after a reboot.
+Stage scores existing and newly launched windows using configured class, optional title-substring rules, executable identity, and process ancestry. Captured Stages begin with the Hyprland initial window class and automatically attach a matching desktop entry when one can be resolved. Review unresolved resources and select their installed application or provide an explicit launch target before relying on them after a reboot.
