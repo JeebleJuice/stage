@@ -8,6 +8,7 @@ The project follows the product definition in `Stage - Persistent Hyprland Works
 
 - Create, edit, duplicate, delete, import, and export Stage definitions.
 - Discover installed Linux applications from standard `.desktop` entries.
+- Discover `~/Dev` projects with an `npm run dev` script and create a complete development Stage for each one.
 - Add applications, files, folders, URLs, terminal directories, reviewed commands, and resumption notes.
 - Capture the current Hyprland window arrangement into a safe draft, resolve installed-application identities where possible, and avoid silently collecting commands or URLs.
 - Persist Stage definitions and restoration history in local SQLite.
@@ -27,6 +28,8 @@ npm run dev
 
 The browser preview uses simulated desktop data and never launches local applications.
 
+On its first native launch, Stage discovers npm development projects under `~/Dev` and adds any missing generated definitions. Each development Stage starts the dev server and a Codex session on workspace 1, waits for the detected local HTTP endpoint before starting `npm run worker` when that script exists, opens the ready application in a new default-browser window on workspace 2, and opens the project in VS Code on workspace 3. Use **Settings → Sync projects** after adding another project. Synchronisation refreshes generated launch and readiness details while preserving personal placement edits.
+
 ## Run the desktop app on Fedora + Hyprland
 
 Install Tauri's Linux prerequisites once:
@@ -41,7 +44,7 @@ Then run:
 npm run desktop
 ```
 
-Stage uses `hyprctl -j` for state and supported Hyprland dispatchers for placement. If Kitty is not your terminal, set `STAGE_TERMINAL` or `TERMINAL` to a compatible terminal command. Terminal commands are passed as explicit argument arrays and are blocked until reviewed in the editor.
+Stage uses `hyprctl -j` for state and Hyprland 0.56's Lua dispatcher API for placement. Windows are moved as soon as they are matched instead of waiting for the whole restoration attempt to finish. If Kitty is not your terminal, set `STAGE_TERMINAL` or `TERMINAL` to a compatible terminal command. Terminal commands are passed as explicit argument arrays and are blocked until reviewed in the editor.
 
 ## Global shortcut
 

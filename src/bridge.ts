@@ -46,6 +46,11 @@ export async function discoverApps(): Promise<InstalledApp[]> {
   ];
 }
 
+export async function discoverDevelopmentStages(root?: string): Promise<StageDefinition[]> {
+  if (isTauri()) return invoke("discover_development_stages", { root });
+  return [];
+}
+
 export async function restoreStage(stage: StageDefinition, operationId: string): Promise<RestoreRun> {
   if (isTauri()) return invoke("restore_stage", { stage, operationId });
   const items = stage.resources.map((resource) => ({ resourceId: resource.id, name: resource.name, status: resource.kind === "note" ? "skipped" as const : "placed" as const, message: resource.kind === "note" ? "Note shown in Stage" : `Previewed on workspace ${resource.placement.workspace}` }));

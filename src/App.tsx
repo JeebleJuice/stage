@@ -1,12 +1,30 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AppWindow, Archive, ArrowLeft, Check, ChevronRight, CircleAlert, CircleDot, Copy, Download, ExternalLink, File, Folder, History, LayoutDashboard, Link2, ListRestart, Monitor, MoreHorizontal, PanelLeft, Pencil, Pin, Plus, Search, Settings, Sparkles, SquareTerminal, Trash2, Upload, Waypoints, X } from "lucide-react";
-import { cancelRestore, captureCurrent, deleteStage, discoverApps, getSnapshot, listRuns, listStages, onRestoreProgress, restoreStage, saveStage } from "./bridge";
+import { AppWindow, Archive, ArrowLeft, Check, ChevronRight, CircleAlert, CircleDot, Copy, Download, ExternalLink, File, Folder, History, LayoutDashboard, Link2, ListRestart, Monitor, MoreHorizontal, PanelLeft, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, SquareTerminal, Trash2, Upload, Waypoints, X } from "lucide-react";
+import { cancelRestore, captureCurrent, deleteStage, discoverApps, discoverDevelopmentStages, getSnapshot, listRuns, listStages, onRestoreProgress, restoreStage, saveStage } from "./bridge";
 import { sampleStages } from "./data";
 import type { InstalledApp, ResourceKind, RestoreItem, RestoreRun, StageDefinition, StageResource, SystemSnapshot, WindowMode } from "./types";
 
 const colors = ["#d7ff72", "#82d8ff", "#ffab76", "#c7a5ff", "#ff83ad"];
 const kindIcon = { app: AppWindow, file: File, folder: Folder, url: Link2, terminal: SquareTerminal, note: Pencil };
 const emptyPlacement = () => ({ workspace: 1, monitor: "", mode: "tiled" as WindowMode, pinned: false });
+
+function reconcileDevelopmentStages(existing: StageDefinition[], generated: StageDefinition[]) {
+  const changed: StageDefinition[] = [];
+  const next = [...existing];
+  for (const candidate of generated) {
+    const index = next.findIndex((stage) => stage.id === candidate.id);
+    if (index < 0) { next.push(candidate); changed.push(candidate); continue; }
+    const current = next[index];
+    if (!current.notes.startsWith("Generated from ")) continue;
+    const resources = candidate.resources.map((resource) => ({ ...resource, placement: current.resources.find((item) => item.id === resource.id)?.placement ?? resource.placement }));
+    if (JSON.stringify(resources) !== JSON.stringify(current.resources)) {
+      const updated = { ...current, resources, updatedAt: new Date().toISOString() };
+      next[index] = updated;
+      changed.push(updated);
+    }
+  }
+  return { stages: next, changed };
+}
 
 function newResource(kind: ResourceKind): StageResource {
   return { id: crypto.randomUUID(), kind, name: kind === "url" ? "Website" : kind === "terminal" ? "Terminal" : kind[0].toUpperCase() + kind.slice(1), target: "", command: [], workingDirectory: "", matchClass: "", matchTitle: "", placement: emptyPlacement(), confirmed: kind !== "terminal", };
@@ -102,7 +120,7 @@ export default function App() {
   const restoreListener = useRef<() => void>(() => undefined);
   const active = stages.find((stage) => stage.id === activeId);
 
-  useEffect(() => { Promise.all([listStages(sampleStages), getSnapshot(), discoverApps(), listRuns()]).then(([saved, system, foundApps, history]) => { setStages(saved.length ? saved : sampleStages); setSnapshot(system); setApps(foundApps); setRuns(history); }).catch((error) => setNotice(String(error))); }, []);
+  useEffect(() => { Promise.all([listStages(sampleStages), getSnapshot(), discoverApps(), listRuns(), discoverDevelopmentStages()]).then(([saved, system, foundApps, history, generated]) => { const reconciled = reconcileDevelopmentStages(saved.length ? saved : [], generated); setStages(reconciled.stages.length ? reconciled.stages : sampleStages); void Promise.all(reconciled.changed.map(saveStage)).catch((error) => setNotice(String(error))); setSnapshot(system); setApps(foundApps); setRuns(history); }).catch((error) => setNotice(String(error))); }, []);
   useEffect(() => () => restoreListener.current(), []);
 
   const persist = (stage: StageDefinition) => { const next = { ...stage, updatedAt: new Date().toISOString() }; setStages((all) => all.map((item) => item.id === next.id ? next : item)); void saveStage(next).catch((error) => setNotice(String(error))); };
@@ -114,6 +132,7 @@ export default function App() {
   const capture = async () => { try { const draft = await captureCurrent(); setStages((all) => [...all, draft]); setActiveId(draft.id); void saveStage(draft); } catch (error) { setNotice(String(error)); } };
   const exportStage = () => { if (!active) return; const href = URL.createObjectURL(new Blob([JSON.stringify(active, null, 2)], { type: "application/json" })); const anchor = document.createElement("a"); anchor.href = href; anchor.download = `${active.name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}.stage.json`; anchor.click(); URL.revokeObjectURL(href); };
   const importStage = async (file?: File) => { if (!file) return; try { const value = JSON.parse(await file.text()) as StageDefinition; if (!value.name || !Array.isArray(value.resources)) throw new Error("Invalid Stage file"); value.id = crypto.randomUUID(); value.updatedAt = new Date().toISOString(); setStages((all) => [...all, value]); setActiveId(value.id); await saveStage(value); } catch (error) { setNotice(String(error)); } };
+  const syncDevelopmentStages = async () => { try { const generated = await discoverDevelopmentStages(); const reconciled = reconcileDevelopmentStages(stages, generated); await Promise.all(reconciled.changed.map(saveStage)); setStages(reconciled.stages); setNotice(reconciled.changed.length ? `Synchronized ${reconciled.changed.length} development stage${reconciled.changed.length === 1 ? "" : "s"}.` : "Development stages are already up to date."); } catch (error) { setNotice(String(error)); } };
   const filtered = useMemo(() => stages.filter((stage) => `${stage.name} ${stage.description}`.toLowerCase().includes(query.toLowerCase())), [stages, query]);
 
   return <div className="app-shell">
@@ -145,7 +164,7 @@ export default function App() {
 
       {view === "history" && <div className="simple-page"><span className="eyebrow">RESTORATION LOG</span><h1>History</h1><p>Every attempt stays visible, including resources Stage could not place.</p><div className="run-list">{runs.map((run) => <article key={run.id}><span className={`run-icon ${run.status}`}><History size={18} /></span><div><b>{run.stageName}</b><small>{new Date(run.startedAt).toLocaleString()} · {run.durationMs} ms</small></div><span>{run.items.filter((item) => item.status !== "failed").length}/{run.items.length} resources</span><i className={run.status}>{run.status}</i></article>)}{!runs.length && <div className="empty-resources"><History size={34} /><h3>No restorations yet</h3><p>Restore a stage and its result will appear here.</p></div>}</div></div>}
 
-      {view === "settings" && <div className="simple-page settings-page"><span className="eyebrow">SYSTEM</span><h1>Stage settings</h1><p>Stage talks to Hyprland through its supported <code>hyprctl -j</code> interface and dispatchers.</p><div className="settings-card"><div><CircleDot size={17} /><span><b>Hyprland connection</b><small>{snapshot.message}</small></span><strong className={snapshot.connected ? "ok" : ""}>{snapshot.connected ? "Connected" : "Unavailable"}</strong></div><div><Monitor size={17} /><span><b>Detected monitors</b><small>{snapshot.monitors.join(", ") || "No monitors reported"}</small></span><strong>{snapshot.monitors.length}</strong></div><div><AppWindow size={17} /><span><b>Open windows</b><small>Available for capture and reuse</small></span><strong>{snapshot.windows.length}</strong></div><div><ExternalLink size={17} /><span><b>Global shortcut</b><small>Add <code>bind = SUPER, S, exec, stage</code> to hyprland.conf after installing.</small></span></div></div></div>}
+      {view === "settings" && <div className="simple-page settings-page"><span className="eyebrow">SYSTEM</span><h1>Stage settings</h1><p>Stage talks to Hyprland through its supported <code>hyprctl -j</code> interface and dispatchers.</p><div className="settings-card"><div><CircleDot size={17} /><span><b>Hyprland connection</b><small>{snapshot.message}</small></span><strong className={snapshot.connected ? "ok" : ""}>{snapshot.connected ? "Connected" : "Unavailable"}</strong></div><div><Monitor size={17} /><span><b>Detected monitors</b><small>{snapshot.monitors.join(", ") || "No monitors reported"}</small></span><strong>{snapshot.monitors.length}</strong></div><div><AppWindow size={17} /><span><b>Open windows</b><small>Available for capture and reuse</small></span><strong>{snapshot.windows.length}</strong></div><div><RefreshCw size={17} /><span><b>Development stages</b><small>Discover npm projects with a dev script under ~/Dev.</small></span><button className="settings-action" onClick={syncDevelopmentStages}>Sync projects</button></div><div><ExternalLink size={17} /><span><b>Global shortcut</b><small>Add <code>bind = SUPER, S, exec, stage</code> to hyprland.conf after installing.</small></span></div></div></div>}
     </main>
     {restoring && <RestoreDialog stage={restoring} run={restoreRun} progress={restoreProgress} running={!restoreRun} onCancel={stopRestore} onClose={() => { setRestoring(undefined); setRestoreRun(undefined); setOperationId(undefined); setRestoreProgress({}); }} />}
     {notice && <button className="toast" onClick={() => setNotice("")}><CircleAlert size={17} /><span>{notice}</span><X size={14} /></button>}

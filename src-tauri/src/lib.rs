@@ -5,6 +5,8 @@ use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
+    io::{Read, Write},
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -40,6 +42,8 @@ struct StageResource {
     match_title: String,
     desktop_file: Option<String>,
     icon: Option<String>,
+    #[serde(default)]
+    wait_for_url: Option<String>,
     placement: Placement,
     confirmed: bool,
 }
@@ -74,7 +78,11 @@ struct InstalledApp {
 struct HyprWindow {
     address: String,
     class_name: String,
+    #[serde(skip_serializing)]
+    initial_class: String,
     title: String,
+    #[serde(skip_serializing)]
+    initial_title: String,
     workspace: i64,
     monitor: String,
     pid: i64,
@@ -155,11 +163,16 @@ fn hypr_json(topic: &str) -> Result<Value, String> {
     serde_json::from_slice(&output.stdout).map_err(|error| format!("Invalid hyprctl JSON for {topic}: {error}"))
 }
 
-fn hypr_dispatch(dispatcher: &str, argument: &str) -> Result<(), String> {
-    let output = Command::new("hyprctl").args(["dispatch", dispatcher, argument]).output()
-        .map_err(|error| format!("Could not dispatch {dispatcher}: {error}"))?;
-    if output.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()) }
+fn hypr_dispatch(expression: &str) -> Result<(), String> {
+    let output = Command::new("hyprctl").args(["dispatch", expression]).output()
+        .map_err(|error| format!("Could not dispatch Hyprland action: {error}"))?;
+    if output.status.success() { return Ok(()); }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(if stdout.is_empty() { stderr } else if stderr.is_empty() { stdout } else { format!("{stdout}\n{stderr}") })
 }
+
+fn lua_string(value: &str) -> String { format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\"")) }
 
 fn json_i64(value: &Value, field: &str) -> i64 { value.get(field).and_then(Value::as_i64).unwrap_or_default() }
 fn json_text(value: &Value, field: &str) -> String { value.get(field).and_then(Value::as_str).unwrap_or_default().to_owned() }
@@ -180,19 +193,17 @@ fn read_hypr_windows() -> Result<(Vec<HyprWindow>, Vec<String>, Vec<i64>), Strin
 
     let clients = hypr_json("clients")?;
     let windows = clients.as_array().into_iter().flatten().map(|client| {
-        let class_name = {
-            let initial = json_text(client, "initialClass");
-            if initial.is_empty() { json_text(client, "class") } else { initial }
-        };
-        let title = {
-            let initial = json_text(client, "initialTitle");
-            if initial.is_empty() { json_text(client, "title") } else { initial }
-        };
+        let class_name = json_text(client, "class");
+        let initial_class = json_text(client, "initialClass");
+        let title = json_text(client, "title");
+        let initial_title = json_text(client, "initialTitle");
         let monitor_id = json_i64(client, "monitor");
         HyprWindow {
             address: json_text(client, "address"),
             class_name,
+            initial_class,
             title,
+            initial_title,
             workspace: client.get("workspace").map(|workspace| json_i64(workspace, "id")).unwrap_or_default(),
             monitor: monitor_by_id.get(&monitor_id).cloned().unwrap_or_default(),
             pid: json_i64(client, "pid"),
@@ -234,13 +245,16 @@ fn resource_match_score(resource: &StageResource, window: &HyprWindow) -> Option
     let class_rule = resource.match_class.trim().to_lowercase();
     let title_rule = resource.match_title.trim().to_lowercase();
     let window_class = window.class_name.to_lowercase();
-    if !title_rule.is_empty() && !window.title.to_lowercase().contains(&title_rule) { return None; }
-    let mut score = if class_rule.is_empty() { 0 } else if window_class == class_rule { 100 } else if window_class.contains(&class_rule) || class_rule.contains(&window_class) { 70 } else { return None; };
-    if !title_rule.is_empty() { score += 25; }
+    let initial_class = window.initial_class.to_lowercase();
+    if !title_rule.is_empty() && !window.title.to_lowercase().contains(&title_rule) && !window.initial_title.to_lowercase().contains(&title_rule) { return None; }
     let executable = resource.command.first().and_then(|item| Path::new(item).file_name()).and_then(|item| item.to_str()).unwrap_or_default().to_lowercase();
     let process_matches = !executable.is_empty() && process_identity(window.pid).iter().any(|identity| identity == &executable);
+    let class_score = if class_rule.is_empty() { None } else if window_class == class_rule || initial_class == class_rule { Some(100) } else if window_class.contains(&class_rule) || class_rule.contains(&window_class) || initial_class.contains(&class_rule) || class_rule.contains(&initial_class) { Some(70) } else { None };
+    if class_score.is_none() && !process_matches { return None; }
+    let mut score = class_score.unwrap_or_default();
+    if !title_rule.is_empty() { score += 25; }
     if process_matches { score += 40; }
-    if class_rule.is_empty() && !process_matches { None } else { Some(score) }
+    Some(score)
 }
 
 fn best_window_match(resource: &StageResource, windows: &[HyprWindow], used: &HashSet<String>) -> Option<HyprWindow> {
@@ -267,17 +281,32 @@ fn terminal_program() -> String {
 fn launch_resource(resource: &StageResource) -> Result<(), String> {
     if resource.kind == "note" { return Ok(()); }
     let mut command = match resource.kind.as_str() {
-        "file" | "folder" | "url" => {
+        "file" | "folder" => {
             if resource.target.trim().is_empty() { return Err("Target is empty".into()); }
             let mut command = Command::new("xdg-open");
             command.arg(&resource.target);
             command
+        }
+        "url" => {
+            if resource.target.trim().is_empty() { return Err("URL is empty".into()); }
+            if resource.command.is_empty() {
+                let mut command = Command::new("xdg-open");
+                command.arg(&resource.target);
+                command
+            } else {
+                let mut command = Command::new(&resource.command[0]);
+                command.args(&resource.command[1..]).arg(&resource.target);
+                command
+            }
         }
         "terminal" => {
             if !resource.command.is_empty() && !resource.confirmed {
                 return Err("Command has not been reviewed and confirmed".into());
             }
             let mut command = Command::new(terminal_program());
+            if !resource.match_title.trim().is_empty() {
+                command.args(["--override", "dynamic_title=no", "--title", resource.match_title.as_str()]);
+            }
             if !resource.working_directory.trim().is_empty() {
                 command.args(["--directory", resource.working_directory.as_str()]);
             }
@@ -308,23 +337,65 @@ fn launch_resource(resource: &StageResource) -> Result<(), String> {
     command.spawn().map(|_| ()).map_err(|error| format!("Could not launch {}: {error}", resource.name))
 }
 
+fn http_endpoint(url: &str) -> Option<(String, u16, String)> {
+    let remainder = url.strip_prefix("http://")?;
+    let (authority, path) = remainder.split_once('/').map(|(authority, path)| (authority, format!("/{path}"))).unwrap_or((remainder, "/".into()));
+    let (host, port) = authority.rsplit_once(':').and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, port))).unwrap_or((authority, 80));
+    if host.is_empty() { None } else { Some((host.into(), port, path)) }
+}
+
+fn url_is_ready(url: &str) -> bool {
+    let Some((host, port, path)) = http_endpoint(url) else { return false; };
+    let Ok(addresses) = (host.as_str(), port).to_socket_addrs() else { return false; };
+    for address in addresses {
+        let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(350)) else { continue; };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+        let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        if stream.write_all(request.as_bytes()).is_err() { continue; }
+        let mut response = [0_u8; 64];
+        let Ok(read) = stream.read(&mut response) else { continue; };
+        let status_line = String::from_utf8_lossy(&response[..read]);
+        let status = status_line.split_whitespace().nth(1).and_then(|value| value.parse::<u16>().ok());
+        if status.is_some_and(|code| code < 500) { return true; }
+    }
+    false
+}
+
+fn wait_until_ready(url: &str, timeout: Duration, cancelled: impl Fn() -> bool) -> Result<(), String> {
+    if http_endpoint(url).is_none() { return Err(format!("Unsupported readiness URL: {url}")); }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if cancelled() { return Err("Restoration was cancelled".into()); }
+        if url_is_ready(url) { return Ok(()); }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Err(format!("Timed out waiting for {url}"))
+}
+
 fn place_window(resource: &StageResource, window: &HyprWindow) -> Result<(), String> {
     let selector = format!("address:{}", window.address);
     if !resource.placement.monitor.trim().is_empty() {
-        hypr_dispatch("moveworkspacetomonitor", &format!("{} {}", resource.placement.workspace, resource.placement.monitor))?;
+        hypr_dispatch(&format!("hl.dsp.workspace.move({{ workspace = {}, monitor = {} }})", lua_string(&resource.placement.workspace.to_string()), lua_string(&resource.placement.monitor)))?;
     }
-    hypr_dispatch("movetoworkspacesilent", &format!("{},{}", resource.placement.workspace, selector))?;
+    hypr_dispatch(&format!("hl.dsp.window.move({{ workspace = {}, follow = false, window = {} }})", lua_string(&resource.placement.workspace.to_string()), lua_string(&selector)))?;
     let should_float = resource.placement.mode == "floating";
-    if should_float != window.floating { hypr_dispatch("togglefloating", &selector)?; }
+    if should_float != window.floating {
+        hypr_dispatch(&format!("hl.dsp.window.float({{ action = {}, window = {} }})", lua_string(if should_float { "set" } else { "unset" }), lua_string(&selector)))?;
+    }
     let should_fullscreen = resource.placement.mode == "fullscreen";
-    if should_fullscreen != window.fullscreen { hypr_dispatch("fullscreen", &format!("0 {selector}"))?; }
-    if resource.placement.pinned != window.pinned { hypr_dispatch("pin", &selector)?; }
+    if should_fullscreen != window.fullscreen {
+        hypr_dispatch(&format!("hl.dsp.window.fullscreen({{ mode = \"fullscreen\", action = {}, window = {} }})", lua_string(if should_fullscreen { "set" } else { "unset" }), lua_string(&selector)))?;
+    }
+    if resource.placement.pinned != window.pinned {
+        hypr_dispatch(&format!("hl.dsp.window.pin({{ action = {}, window = {} }})", lua_string(if resource.placement.pinned { "set" } else { "unset" }), lua_string(&selector)))?;
+    }
     if should_float {
         if let (Some(x), Some(y)) = (resource.placement.x, resource.placement.y) {
-            hypr_dispatch("movewindowpixel", &format!("exact {x} {y},{selector}"))?;
+            hypr_dispatch(&format!("hl.dsp.window.move({{ x = {x}, y = {y}, relative = false, window = {} }})", lua_string(&selector)))?;
         }
         if let (Some(width), Some(height)) = (resource.placement.width, resource.placement.height) {
-            hypr_dispatch("resizewindowpixel", &format!("exact {width} {height},{selector}"))?;
+            hypr_dispatch(&format!("hl.dsp.window.resize({{ x = {width}, y = {height}, relative = false, window = {} }})", lua_string(&selector)))?;
         }
     }
     Ok(())
@@ -348,7 +419,7 @@ fn parse_exec_line(line: &str) -> Vec<String> {
         } else { current.push(character); }
     }
     if !current.is_empty() { parts.push(current); }
-    parts.into_iter().filter(|part| !part.starts_with('%')).collect()
+    parts.into_iter().filter(|part| !part.starts_with('%') && !part.starts_with("@@")).collect()
 }
 
 fn desktop_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
@@ -358,7 +429,11 @@ fn desktop_value<'a>(content: &'a str, key: &str) -> Option<&'a str> {
 
 fn application_directories() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/usr/share/applications"), PathBuf::from("/usr/local/share/applications")];
-    if let Some(data) = dirs::data_local_dir() { paths.push(data.join("applications")); }
+    if let Some(data) = dirs::data_local_dir() {
+        paths.push(data.join("applications"));
+        paths.push(data.join("flatpak/exports/share/applications"));
+    }
+    paths.push(PathBuf::from("/var/lib/flatpak/exports/share/applications"));
     paths
 }
 
@@ -414,6 +489,138 @@ fn read_installed_apps() -> Vec<InstalledApp> {
     applications
 }
 
+fn humanize_project_name(name: &str) -> String {
+    name.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map(|first| first.to_uppercase().collect::<String>() + characters.as_str()).unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn local_url_in(text: &str) -> Option<String> {
+    for prefix in ["http://localhost:", "http://127.0.0.1:"] {
+        if let Some(start) = text.find(prefix) {
+            let remainder = &text[start + prefix.len()..];
+            let port: String = remainder.chars().take_while(char::is_ascii_digit).collect();
+            if !port.is_empty() { return Some(format!("{prefix}{port}")); }
+        }
+    }
+    None
+}
+
+fn configured_url(project: &Path) -> String {
+    for filename in [".env", ".env.local", ".env.example"] {
+        let Ok(content) = fs::read_to_string(project.join(filename)) else { continue; };
+        for key in ["APP_URL", "NEXT_PUBLIC_APP_URL", "WEB_ORIGIN"] {
+            if let Some(value) = content.lines().find_map(|line| line.strip_prefix(&format!("{key}="))) {
+                let cleaned = value.trim().trim_matches(['\'', '"']);
+                if cleaned.starts_with("http://localhost:") || cleaned.starts_with("http://127.0.0.1:") { return cleaned.trim_end_matches('/').into(); }
+            }
+        }
+        if let Some(port) = content.lines().find_map(|line| line.strip_prefix("PORT=")) {
+            let port = port.trim().trim_matches(['\'', '"']);
+            if port.chars().all(|character| character.is_ascii_digit()) { return format!("http://localhost:{port}"); }
+        }
+    }
+    for filename in ["vite.config.ts", "vite.config.js", "vite.config.mjs"] {
+        let Ok(content) = fs::read_to_string(project.join(filename)) else { continue; };
+        if let Some(after_port) = content.split("port:").nth(1) {
+            let port: String = after_port.trim_start().chars().take_while(char::is_ascii_digit).collect();
+            if !port.is_empty() { return format!("http://localhost:{port}"); }
+        }
+    }
+    fs::read_to_string(project.join("README.md")).ok().and_then(|content| local_url_in(&content)).unwrap_or_else(|| "http://localhost:3000".into())
+}
+
+fn project_slug(name: &str) -> String {
+    let slug: String = name.to_lowercase().chars().map(|character| if character.is_ascii_alphanumeric() { character } else { '-' }).collect();
+    slug.split('-').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+fn terminal_resource(id: &str, name: &str, title: &str, project: &Path, command: Vec<String>) -> StageResource {
+    StageResource {
+        id: id.into(), kind: "terminal".into(), name: name.into(), target: command.join(" "), command,
+        working_directory: project.display().to_string(), match_class: "kitty".into(), match_title: title.into(),
+        desktop_file: None, icon: Some("kitty".into()), wait_for_url: None,
+        placement: Placement { workspace: 1, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None },
+        confirmed: true,
+    }
+}
+
+fn development_stages(root: &Path) -> Vec<StageDefinition> {
+    let applications = read_installed_apps();
+    let default_browser_id = Command::new("xdg-settings").args(["get", "default-web-browser"]).output().ok()
+        .filter(|output| output.status.success()).map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned()).unwrap_or_default();
+    let browser = applications.iter().find(|app| app.desktop_file == default_browser_id)
+        .or_else(|| applications.iter().find(|app| app.name.to_lowercase().contains("zen")))
+        .or_else(|| applications.iter().find(|app| app.name.to_lowercase().contains("firefox")));
+    let editor = applications.iter().find(|app| app.desktop_file == "com.microsoft.VSCode.desktop")
+        .or_else(|| applications.iter().find(|app| app.name == "Visual Studio Code"));
+    let Ok(entries) = fs::read_dir(root) else { return Vec::new(); };
+    let mut project_directories: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).filter(|path| path.is_dir()).collect();
+    project_directories.sort();
+    let mut projects = Vec::new();
+    let colors = ["#d7ff72", "#82d8ff", "#ffab76", "#c7a5ff", "#ff83ad"];
+    for project in project_directories {
+        let Ok(package_text) = fs::read_to_string(project.join("package.json")) else { continue; };
+        let Ok(package): Result<Value, _> = serde_json::from_str(&package_text) else { continue; };
+        let Some(scripts) = package.get("scripts").and_then(Value::as_object) else { continue; };
+        if !scripts.contains_key("dev") { continue; }
+        let directory_name = project.file_name().and_then(|value| value.to_str()).unwrap_or("Project");
+        let name = match directory_name {
+            "autostickarena" => "Tribal Auto Sticks".into(),
+            _ => humanize_project_name(directory_name),
+        };
+        let slug = project_slug(directory_name);
+        let project_url = configured_url(&project);
+        let mut resources = vec![
+            terminal_resource(&format!("{slug}-dev"), "Development server", &format!("Stage · {name} · Dev"), &project, vec!["npm".into(), "run".into(), "dev".into()]),
+            terminal_resource(&format!("{slug}-codex"), "Codex session", &format!("Stage · {name} · Codex"), &project, vec!["codex".into()]),
+        ];
+        if scripts.contains_key("worker") {
+            let mut worker = terminal_resource(&format!("{slug}-worker"), "Background worker", &format!("Stage · {name} · Worker"), &project, vec!["npm".into(), "run".into(), "worker".into()]);
+            worker.wait_for_url = Some(project_url.clone());
+            resources.push(worker);
+        }
+        let mut browser_command = browser.map(|app| app.exec.clone()).unwrap_or_default();
+        let browser_name = browser.map(|app| app.name.to_lowercase()).unwrap_or_default();
+        if ["firefox", "zen", "chromium", "chrome"].iter().any(|name| browser_name.contains(name)) && !browser_command.iter().any(|argument| argument == "--new-window") {
+            browser_command.push("--new-window".into());
+        }
+        resources.push(StageResource {
+            id: format!("{slug}-browser"), kind: "url".into(), name: "Application in browser".into(), target: project_url.clone(), command: browser_command,
+            working_directory: String::new(), match_class: browser.map(|app| app.wm_class.clone()).unwrap_or_else(|| "zen".into()), match_title: String::new(),
+            desktop_file: browser.map(|app| app.desktop_file.clone()), icon: browser.map(|app| app.icon.clone()), wait_for_url: Some(project_url),
+            placement: Placement { workspace: 2, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true,
+        });
+        resources.push(StageResource {
+            id: format!("{slug}-editor"), kind: "app".into(), name: "Project editor".into(), target: project.display().to_string(),
+            command: editor.map(|app| app.exec.clone()).unwrap_or_else(|| vec!["code".into()]), working_directory: project.display().to_string(),
+            match_class: editor.map(|app| app.wm_class.clone()).unwrap_or_else(|| "code".into()), match_title: directory_name.into(),
+            desktop_file: editor.map(|app| app.desktop_file.clone()), icon: editor.map(|app| app.icon.clone()), wait_for_url: None,
+            placement: Placement { workspace: 3, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true,
+        });
+        let now = Utc::now().to_rfc3339();
+        projects.push(StageDefinition {
+            id: format!("{slug}-development"), name: format!("{name} development"),
+            description: format!("{} terminals, browser, and project editor", if scripts.contains_key("worker") { 3 } else { 2 }),
+            color: colors[projects.len() % colors.len()].into(), notes: format!("Generated from {}/package.json. Review the current task before coding.", project.display()),
+            focus_workspace: 1, created_at: now.clone(), updated_at: now, resources,
+        });
+    }
+    projects.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    projects
+}
+
+#[tauri::command]
+fn discover_development_stages(root: Option<String>) -> Result<Vec<StageDefinition>, String> {
+    let root = root.map(PathBuf::from).or_else(|| dirs::home_dir().map(|home| home.join("Dev"))).ok_or("Home directory is unavailable")?;
+    Ok(development_stages(&root))
+}
+
 #[tauri::command]
 fn discover_apps() -> Result<Vec<InstalledApp>, String> {
     Ok(read_installed_apps())
@@ -449,10 +656,11 @@ fn capture_current() -> Result<StageDefinition, String> {
             target: String::new(),
             command: application.as_ref().map(|item| item.exec.clone()).unwrap_or_default(),
             working_directory: String::new(),
-            match_class: window.class_name,
+            match_class: if window.initial_class.is_empty() { window.class_name } else { window.initial_class },
             match_title: String::new(),
             desktop_file: application.as_ref().map(|item| item.desktop_file.clone()),
             icon: application.as_ref().map(|item| item.icon.clone()),
+            wait_for_url: None,
             placement: Placement { workspace: window.workspace.max(1), monitor: window.monitor, mode: if window.fullscreen { "fullscreen".into() } else if window.floating { "floating".into() } else { "tiled".into() }, pinned: window.pinned, x: None, y: None, width: None, height: None },
             confirmed: false,
         }
@@ -472,64 +680,87 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
     let started_at = Utc::now().to_rfc3339();
     state.cancelled_restores.lock().map_err(|_| "Restoration state is unavailable".to_string())?.remove(&operation_id);
     emit_progress(&app, &operation_id, "matching", None, "Inspecting open Hyprland windows");
-    let mut windows = read_hypr_windows()?.0;
+    let initial_windows = read_hypr_windows()?.0;
+    let baseline_addresses: HashSet<String> = initial_windows.iter().map(|window| window.address.clone()).collect();
     let mut used = HashSet::new();
-    let mut matched: HashMap<String, (HyprWindow, bool)> = HashMap::new();
-    let mut failures: HashMap<String, String> = HashMap::new();
+    let mut readiness: HashMap<String, Result<(), String>> = HashMap::new();
+    let mut items = Vec::new();
 
     for resource in &stage.resources {
         if restore_cancelled(&state, &operation_id) { break; }
-        if resource.kind == "note" { continue; }
-        if let Some(window) = best_window_match(resource, &windows, &used) {
-            used.insert(window.address.clone());
-            matched.insert(resource.id.clone(), (window, true));
-            emit_progress(&app, &operation_id, "matching", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "reused".into(), message: "Matched an existing window".into() }), format!("Matched {}", resource.name));
+        if resource.kind == "note" {
+            let item = RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "skipped".into(), message: "Resumption note is available in Stage".into() };
+            emit_progress(&app, &operation_id, "placing", Some(item.clone()), format!("Handled {}", resource.name));
+            items.push(item);
+            continue;
+        }
+
+        if let Some(url) = resource.wait_for_url.as_deref() {
+            emit_progress(&app, &operation_id, "waiting", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "launched".into(), message: format!("Waiting for {url} before launch") }), format!("Waiting before launching {}", resource.name));
+            let result = if let Some(cached) = readiness.get(url) { cached.clone() } else {
+                let checked = wait_until_ready(url, Duration::from_secs(45), || restore_cancelled(&state, &operation_id));
+                readiness.insert(url.into(), checked.clone());
+                checked
+            };
+            if let Err(error) = result {
+                if restore_cancelled(&state, &operation_id) { break; }
+                let item = RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: error };
+                emit_progress(&app, &operation_id, "waiting", Some(item.clone()), format!("Dependency for {} was not ready", resource.name));
+                items.push(item);
+                continue;
+            }
+        }
+
+        let windows = read_hypr_windows()?.0;
+        let reuse_existing = resource.kind != "url" || !resource.match_title.trim().is_empty();
+        let existing = reuse_existing.then(|| best_window_match(resource, &windows, &used)).flatten();
+        let (matched, reused) = if let Some(window) = existing {
+            emit_progress(&app, &operation_id, "matching", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "reused".into(), message: "Matched an existing window; placing it now".into() }), format!("Matched {}", resource.name));
+            (Some(window), true)
         } else {
             emit_progress(&app, &operation_id, "launching", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "launched".into(), message: "Launch requested; waiting for its window".into() }), format!("Launching {}", resource.name));
             if let Err(error) = launch_resource(resource) {
-                failures.insert(resource.id.clone(), error.clone());
-                emit_progress(&app, &operation_id, "launching", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: error }), format!("Could not launch {}", resource.name));
+                let item = RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: error };
+                emit_progress(&app, &operation_id, "launching", Some(item.clone()), format!("Could not launch {}", resource.name));
+                items.push(item);
+                continue;
             }
-        }
-    }
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let mut found = None;
+            while !restore_cancelled(&state, &operation_id) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(250));
+                let Ok((latest, _, _)) = read_hypr_windows() else { continue; };
+                let eligible: Vec<HyprWindow> = if resource.kind == "url" && resource.match_title.trim().is_empty() {
+                    latest.into_iter().filter(|window| !baseline_addresses.contains(&window.address)).collect()
+                } else { latest };
+                if let Some(window) = best_window_match(resource, &eligible, &used) { found = Some(window); break; }
+            }
+            (found, false)
+        };
 
-    let pending: Vec<&StageResource> = stage.resources.iter().filter(|resource| resource.kind != "note" && !matched.contains_key(&resource.id) && !failures.contains_key(&resource.id)).collect();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    emit_progress(&app, &operation_id, "waiting", None, "Waiting for newly launched windows");
-    while !restore_cancelled(&state, &operation_id) && Instant::now() < deadline && matched.len() + failures.len() < stage.resources.iter().filter(|resource| resource.kind != "note").count() {
-        thread::sleep(Duration::from_millis(350));
-        if let Ok((latest, _, _)) = read_hypr_windows() { windows = latest; }
-        for resource in &pending {
-            if matched.contains_key(&resource.id) { continue; }
-            if let Some(window) = best_window_match(resource, &windows, &used) {
-                used.insert(window.address.clone());
-                matched.insert(resource.id.clone(), (window, false));
-                emit_progress(&app, &operation_id, "waiting", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "launched".into(), message: "Window appeared; ready to place".into() }), format!("Found {}", resource.name));
+        if restore_cancelled(&state, &operation_id) { break; }
+        let item = if let Some(window) = matched {
+            used.insert(window.address.clone());
+            emit_progress(&app, &operation_id, "placing", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: if reused { "reused".into() } else { "launched".into() }, message: format!("Moving to workspace {}", resource.placement.workspace) }), format!("Placing {}", resource.name));
+            match place_window(resource, &window) {
+                Ok(()) => RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: if reused { "reused".into() } else { "placed".into() }, message: format!("{} on workspace {}", if reused { "Reused existing window" } else { "Launched and placed" }, resource.placement.workspace) },
+                Err(error) => RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: format!("Window found, but placement failed: {error}") },
             }
-        }
+        } else {
+            RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: "No matching window appeared within 12 seconds".into() }
+        };
+        emit_progress(&app, &operation_id, "placing", Some(item.clone()), format!("Handled {}", resource.name));
+        items.push(item);
     }
 
     let was_cancelled = restore_cancelled(&state, &operation_id);
-    let mut items = Vec::new();
-    for resource in &stage.resources {
-        if resource.kind == "note" {
-            items.push(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "skipped".into(), message: "Resumption note is available in Stage".into() });
-        } else if was_cancelled && !failures.contains_key(&resource.id) {
+    if was_cancelled {
+        let handled: HashSet<String> = items.iter().map(|item| item.resource_id.clone()).collect();
+        for resource in stage.resources.iter().filter(|resource| !handled.contains(&resource.id)) {
             items.push(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "skipped".into(), message: "Restoration was cancelled".into() });
-        } else if let Some(message) = failures.get(&resource.id) {
-            items.push(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: message.clone() });
-        } else if let Some((window, reused)) = matched.get(&resource.id) {
-            emit_progress(&app, &operation_id, "placing", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: if *reused { "reused".into() } else { "launched".into() }, message: format!("Moving to workspace {}", resource.placement.workspace) }), format!("Placing {}", resource.name));
-            match place_window(resource, window) {
-                Ok(()) => items.push(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: if *reused { "reused".into() } else { "placed".into() }, message: format!("{} on workspace {}", if *reused { "Reused existing window" } else { "Launched and placed" }, resource.placement.workspace) }),
-                Err(error) => items.push(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: format!("Window found, but placement failed: {error}") }),
-            }
-        } else {
-            items.push(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: "No matching window appeared within 10 seconds".into() });
         }
-        if let Some(item) = items.last().cloned() { emit_progress(&app, &operation_id, "placing", Some(item), format!("Handled {}", resource.name)); }
     }
-    if !was_cancelled { let _ = hypr_dispatch("workspace", &stage.focus_workspace.to_string()); }
+    if !was_cancelled { let _ = hypr_dispatch(&format!("hl.dsp.focus({{ workspace = {} }})", lua_string(&stage.focus_workspace.to_string()))); }
     let failed = items.iter().filter(|item| item.status == "failed").count();
     let handled = items.iter().filter(|item| item.status != "skipped").count();
     let status = if was_cancelled { "cancelled" } else if failed == 0 { "success" } else if failed < handled { "partial" } else { "failed" };
@@ -561,7 +792,7 @@ pub fn run() {
             app.manage(AppState { db_path, cancelled_restores: Mutex::new(HashSet::new()) });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_stages, save_stage, delete_stage, discover_apps, system_snapshot, capture_current, restore_stage, cancel_restore, list_runs])
+        .invoke_handler(tauri::generate_handler![list_stages, save_stage, delete_stage, discover_apps, discover_development_stages, system_snapshot, capture_current, restore_stage, cancel_restore, list_runs])
         .run(tauri::generate_context!())
         .expect("error while running Stage");
 }
@@ -574,14 +805,56 @@ mod tests {
     fn parses_desktop_exec_without_shell_or_field_codes() {
         assert_eq!(parse_exec_line("firefox --new-window %U"), vec!["firefox", "--new-window"]);
         assert_eq!(parse_exec_line("code \"folder with spaces\" %F"), vec!["code", "folder with spaces"]);
+        assert_eq!(parse_exec_line("flatpak run app.zen @@u %u @@"), vec!["flatpak", "run", "app.zen"]);
     }
 
     #[test]
     fn scores_class_and_title_matches() {
-        let resource = StageResource { id: "r".into(), kind: "app".into(), name: "Browser".into(), target: String::new(), command: vec!["firefox".into()], working_directory: String::new(), match_class: "firefox".into(), match_title: "Docs".into(), desktop_file: None, icon: None, placement: Placement { workspace: 1, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
-        let window = HyprWindow { address: "0x1".into(), class_name: "firefox".into(), title: "Rust Docs".into(), workspace: 1, monitor: "DP-1".into(), pid: 1, floating: false, fullscreen: false, pinned: false };
+        let resource = StageResource { id: "r".into(), kind: "app".into(), name: "Browser".into(), target: String::new(), command: vec!["firefox".into()], working_directory: String::new(), match_class: "firefox".into(), match_title: "Docs".into(), desktop_file: None, icon: None, wait_for_url: None, placement: Placement { workspace: 1, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
+        let window = HyprWindow { address: "0x1".into(), class_name: "firefox".into(), initial_class: "Navigator".into(), title: "Rust Docs".into(), initial_title: "Mozilla Firefox".into(), workspace: 1, monitor: "DP-1".into(), pid: 1, floating: false, fullscreen: false, pinned: false };
         assert_eq!(resource_match_score(&resource, &window), Some(125));
         assert_eq!(resource_match_score(&StageResource { match_title: "Mail".into(), ..resource.clone() }, &window), None);
         assert_eq!(resource_match_score(&StageResource { match_class: "kitty".into(), ..resource }, &window), None);
+    }
+
+    #[test]
+    fn process_identity_can_recover_from_a_desktop_class_mismatch() {
+        let executable = std::env::current_exe().unwrap();
+        let resource = StageResource { id: "editor".into(), kind: "app".into(), name: "Editor".into(), target: String::new(), command: vec![executable.display().to_string()], working_directory: String::new(), match_class: "desktop-entry-class".into(), match_title: String::new(), desktop_file: None, icon: None, wait_for_url: None, placement: Placement { workspace: 3, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
+        let window = HyprWindow { address: "0x2".into(), class_name: "actual-wayland-class".into(), initial_class: "actual-wayland-class".into(), title: "Project".into(), initial_title: "Editor".into(), workspace: 1, monitor: "DP-1".into(), pid: std::process::id() as i64, floating: false, fullscreen: false, pinned: false };
+        assert_eq!(resource_match_score(&resource, &window), Some(40));
+    }
+
+    #[test]
+    fn discovers_dev_projects_and_adds_workers_only_when_declared() {
+        let root = std::env::temp_dir().join(format!("stage-projects-{}", Uuid::new_v4()));
+        let app = root.join("photo-app");
+        let tool = root.join("small-tool");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&tool).unwrap();
+        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"next dev","worker":"tsx worker.ts"}}"#).unwrap();
+        fs::write(app.join(".env.example"), "APP_URL=http://localhost:3300\n").unwrap();
+        fs::write(tool.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).unwrap();
+        fs::write(tool.join("vite.config.ts"), "export default { server: { port: 4173 } }").unwrap();
+
+        let stages = development_stages(&root);
+        assert_eq!(stages.len(), 2);
+        let photo = stages.iter().find(|stage| stage.id == "photo-app-development").unwrap();
+        assert_eq!(photo.resources.iter().filter(|resource| resource.placement.workspace == 1).count(), 3);
+        assert_eq!(photo.resources.iter().find(|resource| resource.kind == "url").unwrap().target, "http://localhost:3300");
+        assert_eq!(photo.resources.iter().find(|resource| resource.name == "Background worker").unwrap().wait_for_url.as_deref(), Some("http://localhost:3300"));
+        assert_eq!(photo.resources.iter().find(|resource| resource.kind == "url").unwrap().wait_for_url.as_deref(), Some("http://localhost:3300"));
+        let small = stages.iter().find(|stage| stage.id == "small-tool-development").unwrap();
+        assert_eq!(small.resources.iter().filter(|resource| resource.placement.workspace == 1).count(), 2);
+        assert_eq!(small.resources.iter().find(|resource| resource.kind == "url").unwrap().target, "http://localhost:4173");
+        assert!(stages.iter().all(|stage| stage.resources.iter().any(|resource| resource.placement.workspace == 3 && resource.kind == "app")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_local_http_readiness_endpoints() {
+        assert_eq!(http_endpoint("http://localhost:3300/api/health"), Some(("localhost".into(), 3300, "/api/health".into())));
+        assert_eq!(http_endpoint("http://127.0.0.1"), Some(("127.0.0.1".into(), 80, "/".into())));
+        assert_eq!(http_endpoint("https://localhost:3000"), None);
     }
 }

@@ -23,6 +23,7 @@ export interface StageResource {
   matchTitle: string;
   desktopFile?: string;
   icon?: string;
+  waitForUrl?: string;
   placement: Placement;
   confirmed: boolean;
 }
