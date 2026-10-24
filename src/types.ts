@@ -24,6 +24,7 @@ export interface StageResource {
   desktopFile?: string;
   icon?: string;
   waitForUrl?: string;
+  preLaunch?: string[][];
   placement: Placement;
   confirmed: boolean;
 }
@@ -34,6 +35,7 @@ export interface StageDefinition {
   description: string;
   color: string;
   notes: string;
+  clearWorkspaces: boolean;
   focusWorkspace: number;
   createdAt: string;
   updatedAt: string;
@@ -89,7 +91,7 @@ export interface RestoreRun {
 
 export interface RestoreProgress {
   operationId: string;
-  phase: "matching" | "launching" | "waiting" | "placing" | "complete" | "cancelled";
+  phase: "preparing" | "matching" | "launching" | "waiting" | "placing" | "complete" | "cancelled";
   item?: RestoreItem;
   message: string;
 }

@@ -44,6 +44,8 @@ struct StageResource {
     icon: Option<String>,
     #[serde(default)]
     wait_for_url: Option<String>,
+    #[serde(default)]
+    pre_launch: Vec<Vec<String>>,
     placement: Placement,
     confirmed: bool,
 }
@@ -56,6 +58,8 @@ struct StageDefinition {
     description: String,
     color: String,
     notes: String,
+    #[serde(default)]
+    clear_workspaces: bool,
     focus_workspace: i64,
     created_at: String,
     updated_at: String,
@@ -241,6 +245,35 @@ fn process_identity(pid: i64) -> Vec<String> {
     identities
 }
 
+fn process_parent(pid: i64) -> Option<i64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(')')?.1.trim();
+    after_name.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn is_descendant(mut pid: i64, ancestor: i64) -> bool {
+    for _ in 0..32 {
+        let Some(parent) = process_parent(pid) else { return false; };
+        if parent == ancestor { return true; }
+        if parent <= 1 || parent == pid { return false; }
+        pid = parent;
+    }
+    false
+}
+
+fn terminal_command_active(window_pid: i64, command: &[String]) -> bool {
+    if command.is_empty() { return true; }
+    let expected = command.iter().filter(|argument| argument.as_str() != "--").map(|argument| argument.to_lowercase()).collect::<Vec<_>>();
+    let Ok(processes) = fs::read_dir("/proc") else { return false; };
+    processes.flatten().filter_map(|entry| entry.file_name().to_string_lossy().parse::<i64>().ok()).any(|pid| {
+        if pid == window_pid || !is_descendant(pid, window_pid) { return false; }
+        fs::read(format!("/proc/{pid}/cmdline")).ok().is_some_and(|bytes| {
+            let actual = String::from_utf8_lossy(&bytes).replace('\0', " ").to_lowercase();
+            expected.iter().all(|argument| actual.contains(argument))
+        })
+    })
+}
+
 fn resource_match_score(resource: &StageResource, window: &HyprWindow) -> Option<i32> {
     let class_rule = resource.match_class.trim().to_lowercase();
     let title_rule = resource.match_title.trim().to_lowercase();
@@ -259,9 +292,34 @@ fn resource_match_score(resource: &StageResource, window: &HyprWindow) -> Option
 
 fn best_window_match(resource: &StageResource, windows: &[HyprWindow], used: &HashSet<String>) -> Option<HyprWindow> {
     windows.iter().filter(|window| !used.contains(&window.address))
+        .filter(|window| resource.kind != "terminal" || terminal_command_active(window.pid, &resource.command))
         .filter_map(|window| resource_match_score(resource, window).map(|score| (score, window)))
         .max_by_key(|(score, _)| *score)
         .map(|(_, window)| window.clone())
+}
+
+fn evacuation_destinations(windows: &[HyprWindow], targets: &[i64]) -> HashMap<i64, i64> {
+    let occupied: HashSet<i64> = windows.iter().map(|window| window.workspace).filter(|workspace| *workspace > 0).collect();
+    let mut ordered = targets.iter().copied().filter(|workspace| *workspace > 0).collect::<Vec<_>>();
+    ordered.sort_unstable();
+    ordered.dedup();
+    if ordered.is_empty() { return HashMap::new(); }
+    let mut base = 4;
+    while (base..base + ordered.len() as i64).any(|workspace| occupied.contains(&workspace)) { base += 1; }
+    ordered.into_iter().enumerate().map(|(offset, source)| (source, base + offset as i64)).collect()
+}
+
+fn evacuate_stage_workspaces(stage: &StageDefinition, windows: &[HyprWindow]) -> Result<usize, String> {
+    let targets = stage.resources.iter().filter(|resource| resource.kind != "note").map(|resource| resource.placement.workspace).collect::<Vec<_>>();
+    let destinations = evacuation_destinations(windows, &targets);
+    let mut moved = 0;
+    for window in windows {
+        let Some(destination) = destinations.get(&window.workspace) else { continue; };
+        let selector = format!("address:{}", window.address);
+        hypr_dispatch(&format!("hl.dsp.window.move({{ workspace = {}, follow = false, window = {} }})", lua_string(&destination.to_string()), lua_string(&selector)))?;
+        moved += 1;
+    }
+    Ok(moved)
 }
 
 fn emit_progress(app: &tauri::AppHandle, operation_id: &str, phase: &str, item: Option<RestoreItem>, message: impl Into<String>) {
@@ -335,6 +393,23 @@ fn launch_resource(resource: &StageResource) -> Result<(), String> {
         command.current_dir(&resource.working_directory);
     }
     command.spawn().map(|_| ()).map_err(|error| format!("Could not launch {}: {error}", resource.name))
+}
+
+fn run_pre_launch(resource: &StageResource) -> Result<(), String> {
+    for arguments in &resource.pre_launch {
+        let Some(program) = arguments.first() else { continue; };
+        let mut command = Command::new(program);
+        command.args(&arguments[1..]);
+        if !resource.working_directory.trim().is_empty() { command.current_dir(&resource.working_directory); }
+        let output = command.output().map_err(|error| format!("Could not run prerequisite `{}`: {error}", arguments.join(" ")))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            return Err(format!("Prerequisite `{}` failed{}", arguments.join(" "), if detail.is_empty() { String::new() } else { format!(": {detail}") }));
+        }
+    }
+    Ok(())
 }
 
 fn http_endpoint(url: &str) -> Option<(String, u16, String)> {
@@ -544,7 +619,7 @@ fn terminal_resource(id: &str, name: &str, title: &str, project: &Path, command:
     StageResource {
         id: id.into(), kind: "terminal".into(), name: name.into(), target: command.join(" "), command,
         working_directory: project.display().to_string(), match_class: "kitty".into(), match_title: title.into(),
-        desktop_file: None, icon: Some("kitty".into()), wait_for_url: None,
+        desktop_file: None, icon: Some("kitty".into()), wait_for_url: None, pre_launch: Vec::new(),
         placement: Placement { workspace: 1, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None },
         confirmed: true,
     }
@@ -576,8 +651,22 @@ fn development_stages(root: &Path) -> Vec<StageDefinition> {
         };
         let slug = project_slug(directory_name);
         let project_url = configured_url(&project);
+        let dev_script = scripts.get("dev").and_then(Value::as_str).unwrap_or_default();
+        let mut dev_command = vec!["npm".into(), "run".into(), "dev".into()];
+        if dev_script.contains("next dev") {
+            if let Some((_, port, _)) = http_endpoint(&project_url) {
+                if port != 3000 { dev_command.extend(["--".into(), "--port".into(), port.to_string()]); }
+            }
+        }
+        let mut development = terminal_resource(&format!("{slug}-dev"), "Development server", &format!("Stage · {name} · Dev"), &project, dev_command);
+        if scripts.contains_key("db:dev") { development.pre_launch.push(vec!["npm".into(), "run".into(), "db:dev".into()]); }
+        if scripts.contains_key("prisma:deploy:local") { development.pre_launch.push(vec!["npm".into(), "run".into(), "prisma:deploy:local".into()]); }
+        if scripts.contains_key("db:setup") && (project.join("docker-compose.yml").exists() || project.join("compose.yml").exists()) {
+            development.pre_launch.push(vec!["docker".into(), "compose".into(), "up".into(), "-d".into(), "db".into()]);
+            development.pre_launch.push(vec!["npm".into(), "run".into(), "db:setup".into()]);
+        }
         let mut resources = vec![
-            terminal_resource(&format!("{slug}-dev"), "Development server", &format!("Stage · {name} · Dev"), &project, vec!["npm".into(), "run".into(), "dev".into()]),
+            development,
             terminal_resource(&format!("{slug}-codex"), "Codex session", &format!("Stage · {name} · Codex"), &project, vec!["codex".into()]),
         ];
         if scripts.contains_key("worker") {
@@ -593,14 +682,14 @@ fn development_stages(root: &Path) -> Vec<StageDefinition> {
         resources.push(StageResource {
             id: format!("{slug}-browser"), kind: "url".into(), name: "Application in browser".into(), target: project_url.clone(), command: browser_command,
             working_directory: String::new(), match_class: browser.map(|app| app.wm_class.clone()).unwrap_or_else(|| "zen".into()), match_title: String::new(),
-            desktop_file: browser.map(|app| app.desktop_file.clone()), icon: browser.map(|app| app.icon.clone()), wait_for_url: Some(project_url),
+            desktop_file: browser.map(|app| app.desktop_file.clone()), icon: browser.map(|app| app.icon.clone()), wait_for_url: Some(project_url), pre_launch: Vec::new(),
             placement: Placement { workspace: 2, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true,
         });
         resources.push(StageResource {
             id: format!("{slug}-editor"), kind: "app".into(), name: "Project editor".into(), target: project.display().to_string(),
             command: editor.map(|app| app.exec.clone()).unwrap_or_else(|| vec!["code".into()]), working_directory: project.display().to_string(),
             match_class: editor.map(|app| app.wm_class.clone()).unwrap_or_else(|| "code".into()), match_title: directory_name.into(),
-            desktop_file: editor.map(|app| app.desktop_file.clone()), icon: editor.map(|app| app.icon.clone()), wait_for_url: None,
+            desktop_file: editor.map(|app| app.desktop_file.clone()), icon: editor.map(|app| app.icon.clone()), wait_for_url: None, pre_launch: Vec::new(),
             placement: Placement { workspace: 3, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true,
         });
         let now = Utc::now().to_rfc3339();
@@ -608,7 +697,7 @@ fn development_stages(root: &Path) -> Vec<StageDefinition> {
             id: format!("{slug}-development"), name: format!("{name} development"),
             description: format!("{} terminals, browser, and project editor", if scripts.contains_key("worker") { 3 } else { 2 }),
             color: colors[projects.len() % colors.len()].into(), notes: format!("Generated from {}/package.json. Review the current task before coding.", project.display()),
-            focus_workspace: 1, created_at: now.clone(), updated_at: now, resources,
+            clear_workspaces: true, focus_workspace: 1, created_at: now.clone(), updated_at: now, resources,
         });
     }
     projects.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
@@ -661,11 +750,12 @@ fn capture_current() -> Result<StageDefinition, String> {
             desktop_file: application.as_ref().map(|item| item.desktop_file.clone()),
             icon: application.as_ref().map(|item| item.icon.clone()),
             wait_for_url: None,
+            pre_launch: Vec::new(),
             placement: Placement { workspace: window.workspace.max(1), monitor: window.monitor, mode: if window.fullscreen { "fullscreen".into() } else if window.floating { "floating".into() } else { "tiled".into() }, pinned: window.pinned, x: None, y: None, width: None, height: None },
             confirmed: false,
         }
     }).collect();
-    Ok(StageDefinition { id: Uuid::new_v4().to_string(), name: "Captured setup".into(), description: "Draft captured from open Hyprland windows — review launch details before saving.".into(), color: "#82d8ff".into(), notes: "Stage deliberately did not capture command arguments or browser URLs.".into(), focus_workspace: 1, created_at: now.clone(), updated_at: now, resources })
+    Ok(StageDefinition { id: Uuid::new_v4().to_string(), name: "Captured setup".into(), description: "Draft captured from open Hyprland windows — review launch details before saving.".into(), color: "#82d8ff".into(), notes: "Stage deliberately did not capture command arguments or browser URLs.".into(), clear_workspaces: false, focus_workspace: 1, created_at: now.clone(), updated_at: now, resources })
 }
 
 #[tauri::command]
@@ -679,6 +769,12 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
     let started = Instant::now();
     let started_at = Utc::now().to_rfc3339();
     state.cancelled_restores.lock().map_err(|_| "Restoration state is unavailable".to_string())?.remove(&operation_id);
+    if stage.clear_workspaces {
+        emit_progress(&app, &operation_id, "preparing", None, "Making room on the Stage workspaces");
+        let windows = read_hypr_windows()?.0;
+        let moved = evacuate_stage_workspaces(&stage, &windows)?;
+        emit_progress(&app, &operation_id, "preparing", None, format!("Moved {moved} existing window{} out of the way", if moved == 1 { "" } else { "s" }));
+    }
     emit_progress(&app, &operation_id, "matching", None, "Inspecting open Hyprland windows");
     let initial_windows = read_hypr_windows()?.0;
     let baseline_addresses: HashSet<String> = initial_windows.iter().map(|window| window.address.clone()).collect();
@@ -693,6 +789,16 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
             emit_progress(&app, &operation_id, "placing", Some(item.clone()), format!("Handled {}", resource.name));
             items.push(item);
             continue;
+        }
+
+        if !resource.pre_launch.is_empty() {
+            emit_progress(&app, &operation_id, "preparing", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "launched".into(), message: "Running project prerequisites".into() }), format!("Preparing {}", resource.name));
+            if let Err(error) = run_pre_launch(resource) {
+                let item = RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: error };
+                emit_progress(&app, &operation_id, "preparing", Some(item.clone()), format!("Could not prepare {}", resource.name));
+                items.push(item);
+                continue;
+            }
         }
 
         if let Some(url) = resource.wait_for_url.as_deref() {
@@ -810,7 +916,7 @@ mod tests {
 
     #[test]
     fn scores_class_and_title_matches() {
-        let resource = StageResource { id: "r".into(), kind: "app".into(), name: "Browser".into(), target: String::new(), command: vec!["firefox".into()], working_directory: String::new(), match_class: "firefox".into(), match_title: "Docs".into(), desktop_file: None, icon: None, wait_for_url: None, placement: Placement { workspace: 1, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
+        let resource = StageResource { id: "r".into(), kind: "app".into(), name: "Browser".into(), target: String::new(), command: vec!["firefox".into()], working_directory: String::new(), match_class: "firefox".into(), match_title: "Docs".into(), desktop_file: None, icon: None, wait_for_url: None, pre_launch: Vec::new(), placement: Placement { workspace: 1, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
         let window = HyprWindow { address: "0x1".into(), class_name: "firefox".into(), initial_class: "Navigator".into(), title: "Rust Docs".into(), initial_title: "Mozilla Firefox".into(), workspace: 1, monitor: "DP-1".into(), pid: 1, floating: false, fullscreen: false, pinned: false };
         assert_eq!(resource_match_score(&resource, &window), Some(125));
         assert_eq!(resource_match_score(&StageResource { match_title: "Mail".into(), ..resource.clone() }, &window), None);
@@ -820,7 +926,7 @@ mod tests {
     #[test]
     fn process_identity_can_recover_from_a_desktop_class_mismatch() {
         let executable = std::env::current_exe().unwrap();
-        let resource = StageResource { id: "editor".into(), kind: "app".into(), name: "Editor".into(), target: String::new(), command: vec![executable.display().to_string()], working_directory: String::new(), match_class: "desktop-entry-class".into(), match_title: String::new(), desktop_file: None, icon: None, wait_for_url: None, placement: Placement { workspace: 3, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
+        let resource = StageResource { id: "editor".into(), kind: "app".into(), name: "Editor".into(), target: String::new(), command: vec![executable.display().to_string()], working_directory: String::new(), match_class: "desktop-entry-class".into(), match_title: String::new(), desktop_file: None, icon: None, wait_for_url: None, pre_launch: Vec::new(), placement: Placement { workspace: 3, monitor: String::new(), mode: "tiled".into(), pinned: false, x: None, y: None, width: None, height: None }, confirmed: true };
         let window = HyprWindow { address: "0x2".into(), class_name: "actual-wayland-class".into(), initial_class: "actual-wayland-class".into(), title: "Project".into(), initial_title: "Editor".into(), workspace: 1, monitor: "DP-1".into(), pid: std::process::id() as i64, floating: false, fullscreen: false, pinned: false };
         assert_eq!(resource_match_score(&resource, &window), Some(40));
     }
@@ -832,7 +938,7 @@ mod tests {
         let tool = root.join("small-tool");
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(&tool).unwrap();
-        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"next dev","worker":"tsx worker.ts"}}"#).unwrap();
+        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"next dev","worker":"tsx worker.ts","db:dev":"docker compose up -d","prisma:deploy:local":"prisma migrate deploy"}}"#).unwrap();
         fs::write(app.join(".env.example"), "APP_URL=http://localhost:3300\n").unwrap();
         fs::write(tool.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).unwrap();
         fs::write(tool.join("vite.config.ts"), "export default { server: { port: 4173 } }").unwrap();
@@ -840,7 +946,11 @@ mod tests {
         let stages = development_stages(&root);
         assert_eq!(stages.len(), 2);
         let photo = stages.iter().find(|stage| stage.id == "photo-app-development").unwrap();
+        assert!(photo.clear_workspaces);
         assert_eq!(photo.resources.iter().filter(|resource| resource.placement.workspace == 1).count(), 3);
+        let development = photo.resources.iter().find(|resource| resource.name == "Development server").unwrap();
+        assert_eq!(development.command, vec!["npm", "run", "dev", "--", "--port", "3300"]);
+        assert_eq!(development.pre_launch, vec![vec!["npm", "run", "db:dev"], vec!["npm", "run", "prisma:deploy:local"]]);
         assert_eq!(photo.resources.iter().find(|resource| resource.kind == "url").unwrap().target, "http://localhost:3300");
         assert_eq!(photo.resources.iter().find(|resource| resource.name == "Background worker").unwrap().wait_for_url.as_deref(), Some("http://localhost:3300"));
         assert_eq!(photo.resources.iter().find(|resource| resource.kind == "url").unwrap().wait_for_url.as_deref(), Some("http://localhost:3300"));
@@ -849,6 +959,16 @@ mod tests {
         assert_eq!(small.resources.iter().find(|resource| resource.kind == "url").unwrap().target, "http://localhost:4173");
         assert!(stages.iter().all(|stage| stage.resources.iter().any(|resource| resource.placement.workspace == 3 && resource.kind == "app")));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finds_an_empty_workspace_block_for_evacuated_windows() {
+        let window = |address: &str, workspace| HyprWindow { address: address.into(), class_name: String::new(), initial_class: String::new(), title: String::new(), initial_title: String::new(), workspace, monitor: String::new(), pid: 1, floating: false, fullscreen: false, pinned: false };
+        let windows = vec![window("1", 1), window("2", 2), window("4", 4), window("6", 6)];
+        let destinations = evacuation_destinations(&windows, &[1, 2, 3]);
+        assert_eq!(destinations.get(&1), Some(&7));
+        assert_eq!(destinations.get(&2), Some(&8));
+        assert_eq!(destinations.get(&3), Some(&9));
     }
 
     #[test]

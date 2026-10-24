@@ -28,7 +28,7 @@ npm run dev
 
 The browser preview uses simulated desktop data and never launches local applications.
 
-On its first native launch, Stage discovers npm development projects under `~/Dev` and adds any missing generated definitions. Each development Stage starts the dev server and a Codex session on workspace 1, waits for the detected local HTTP endpoint before starting `npm run worker` when that script exists, opens the ready application in a new default-browser window on workspace 2, and opens the project in VS Code on workspace 3. Use **Settings → Sync projects** after adding another project. Synchronisation refreshes generated launch and readiness details while preserving personal placement edits.
+On its first native launch, Stage discovers npm development projects under `~/Dev` and adds any missing generated definitions. Before restoring a generated development Stage, it moves every existing window on workspaces 1–3 into the first empty three-workspace block at workspace 4 or later. It then starts the dev server and a Codex session on workspace 1, waits for the detected local HTTP endpoint before starting `npm run worker` when that script exists, opens the ready application in a new default-browser window on workspace 2, and opens the project in VS Code on workspace 3. Project database prerequisites declared by the generated Stage run before the dev server, and held terminals with an exited command are relaunched instead of reused. Use **Settings → Sync projects** after adding another project. Synchronisation refreshes generated launch, prerequisite, readiness, and make-room details while preserving personal placement edits.
 
 ## Run the desktop app on Fedora + Hyprland
 

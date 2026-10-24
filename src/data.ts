@@ -8,6 +8,7 @@ export const sampleStages: StageDefinition[] = [{
   description: "Code, application, files and project notes",
   color: "#d7ff72",
   notes: "Pick up from the current gallery and worker tasks.",
+  clearWorkspaces: true,
   focusWorkspace: 1,
   createdAt: now,
   updatedAt: now,
