@@ -424,8 +424,8 @@ fn url_is_ready(url: &str) -> bool {
     let Ok(addresses) = (host.as_str(), port).to_socket_addrs() else { return false; };
     for address in addresses {
         let Ok(mut stream) = TcpStream::connect_timeout(&address, Duration::from_millis(350)) else { continue; };
-        let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
         let request = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         if stream.write_all(request.as_bytes()).is_err() { continue; }
         let mut response = [0_u8; 64];
@@ -1012,5 +1012,18 @@ mod tests {
         assert_eq!(http_endpoint("http://localhost:3300/api/health"), Some(("localhost".into(), 3300, "/api/health".into())));
         assert_eq!(http_endpoint("http://127.0.0.1"), Some(("127.0.0.1".into(), 80, "/".into())));
         assert_eq!(http_endpoint("https://localhost:3000"), None);
+    }
+
+    #[test]
+    fn accepts_a_slow_but_healthy_local_http_response() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_millis(750));
+            stream.write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n").unwrap();
+        });
+        assert!(url_is_ready(&format!("http://127.0.0.1:{port}")));
+        server.join().unwrap();
     }
 }
