@@ -64,6 +64,11 @@ export async function cancelRestore(operationId: string): Promise<void> {
   if (isTauri()) return invoke("cancel_restore", { operationId });
 }
 
+export async function closeStage(stage: StageDefinition): Promise<number> {
+  if (isTauri()) return invoke<number>("close_stage", { stage });
+  return 0;
+}
+
 export async function onRestoreProgress(handler: (progress: RestoreProgress) => void): Promise<UnlistenFn> {
   if (!isTauri()) return () => undefined;
   return listen<RestoreProgress>("stage://restore-progress", (event) => handler(event.payload));

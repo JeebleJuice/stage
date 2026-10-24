@@ -14,6 +14,7 @@ The project follows the product definition in `Stage - Persistent Hyprland Works
 - Persist Stage definitions and restoration history in local SQLite.
 - Reuse matching open windows before launching missing resources.
 - Place windows through Hyprland dispatchers, including workspace, monitor, tiled/floating/fullscreen, pinned state, and optional floating geometry.
+- Close every application window on a Stage's declared workspaces in one confirmed action, while keeping Stage itself open.
 - Stream per-resource restoration progress, support cancellation, and report each reused, launched, placed, skipped, timed-out, or failed resource.
 - Run the UI in a browser with a safe simulated adapter for interface development.
 

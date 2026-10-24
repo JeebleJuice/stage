@@ -615,6 +615,15 @@ fn project_slug(name: &str) -> String {
     slug.split('-').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("-")
 }
 
+fn compose_defines_service(project: &Path, service: &str) -> bool {
+    ["compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml"].iter().any(|filename| {
+        fs::read_to_string(project.join(filename)).ok().is_some_and(|content| content.lines().any(|line| {
+            let trimmed = line.trim();
+            line.len() > trimmed.len() && trimmed == format!("{service}:")
+        }))
+    })
+}
+
 fn terminal_resource(id: &str, name: &str, title: &str, project: &Path, command: Vec<String>) -> StageResource {
     StageResource {
         id: id.into(), kind: "terminal".into(), name: name.into(), target: command.join(" "), command,
@@ -661,8 +670,10 @@ fn development_stages(root: &Path) -> Vec<StageDefinition> {
         let mut development = terminal_resource(&format!("{slug}-dev"), "Development server", &format!("Stage · {name} · Dev"), &project, dev_command);
         if scripts.contains_key("db:dev") { development.pre_launch.push(vec!["npm".into(), "run".into(), "db:dev".into()]); }
         if scripts.contains_key("prisma:deploy:local") { development.pre_launch.push(vec!["npm".into(), "run".into(), "prisma:deploy:local".into()]); }
-        if scripts.contains_key("db:setup") && (project.join("docker-compose.yml").exists() || project.join("compose.yml").exists()) {
-            development.pre_launch.push(vec!["docker".into(), "compose".into(), "up".into(), "-d".into(), "db".into()]);
+        if scripts.contains_key("db:setup") {
+            if compose_defines_service(&project, "db") {
+                development.pre_launch.push(vec!["docker".into(), "compose".into(), "up".into(), "-d".into(), "--wait".into(), "db".into()]);
+            }
             development.pre_launch.push(vec!["npm".into(), "run".into(), "db:setup".into()]);
         }
         let mut resources = vec![
@@ -762,6 +773,29 @@ fn capture_current() -> Result<StageDefinition, String> {
 fn cancel_restore(operation_id: String, state: State<AppState>) -> Result<(), String> {
     state.cancelled_restores.lock().map_err(|_| "Restoration state is unavailable".to_string())?.insert(operation_id);
     Ok(())
+}
+
+#[tauri::command]
+fn close_stage(stage: StageDefinition) -> Result<usize, String> {
+    let target_workspaces: HashSet<i64> = stage.resources.iter()
+        .filter(|resource| resource.kind != "note" && resource.placement.workspace > 0)
+        .map(|resource| resource.placement.workspace)
+        .collect();
+    let windows = read_hypr_windows()?.0;
+    let stage_pid = std::process::id() as i64;
+    let targets = windows.into_iter()
+        .filter(|window| window.pid != stage_pid && target_workspaces.contains(&window.workspace))
+        .collect::<Vec<_>>();
+    let mut errors = Vec::new();
+    let mut closed = 0;
+    for window in targets {
+        let selector = format!("address:{}", window.address);
+        match hypr_dispatch(&format!("hl.dsp.window.close({{ window = {} }})", lua_string(&selector))) {
+            Ok(()) => closed += 1,
+            Err(error) => errors.push(format!("{}: {error}", window.title)),
+        }
+    }
+    if errors.is_empty() { Ok(closed) } else { Err(format!("Closed {closed} windows; {}", errors.join("; "))) }
 }
 
 #[tauri::command]
@@ -898,7 +932,7 @@ pub fn run() {
             app.manage(AppState { db_path, cancelled_restores: Mutex::new(HashSet::new()) });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![list_stages, save_stage, delete_stage, discover_apps, discover_development_stages, system_snapshot, capture_current, restore_stage, cancel_restore, list_runs])
+        .invoke_handler(tauri::generate_handler![list_stages, save_stage, delete_stage, discover_apps, discover_development_stages, system_snapshot, capture_current, restore_stage, cancel_restore, close_stage, list_runs])
         .run(tauri::generate_context!())
         .expect("error while running Stage");
 }
@@ -938,7 +972,8 @@ mod tests {
         let tool = root.join("small-tool");
         fs::create_dir_all(&app).unwrap();
         fs::create_dir_all(&tool).unwrap();
-        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"next dev","worker":"tsx worker.ts","db:dev":"docker compose up -d","prisma:deploy:local":"prisma migrate deploy"}}"#).unwrap();
+        fs::write(app.join("package.json"), r#"{"scripts":{"dev":"next dev","worker":"tsx worker.ts","db:dev":"docker compose up -d","prisma:deploy:local":"prisma migrate deploy","db:setup":"prisma db push"}}"#).unwrap();
+        fs::write(app.join("docker-compose.yml"), "services:\n  setup:\n    image: example\n").unwrap();
         fs::write(app.join(".env.example"), "APP_URL=http://localhost:3300\n").unwrap();
         fs::write(tool.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).unwrap();
         fs::write(tool.join("vite.config.ts"), "export default { server: { port: 4173 } }").unwrap();
@@ -950,7 +985,8 @@ mod tests {
         assert_eq!(photo.resources.iter().filter(|resource| resource.placement.workspace == 1).count(), 3);
         let development = photo.resources.iter().find(|resource| resource.name == "Development server").unwrap();
         assert_eq!(development.command, vec!["npm", "run", "dev", "--", "--port", "3300"]);
-        assert_eq!(development.pre_launch, vec![vec!["npm", "run", "db:dev"], vec!["npm", "run", "prisma:deploy:local"]]);
+        assert_eq!(development.pre_launch, vec![vec!["npm", "run", "db:dev"], vec!["npm", "run", "prisma:deploy:local"], vec!["npm", "run", "db:setup"]]);
+        assert!(!development.pre_launch.iter().any(|command| command.first().is_some_and(|program| program == "docker")));
         assert_eq!(photo.resources.iter().find(|resource| resource.kind == "url").unwrap().target, "http://localhost:3300");
         assert_eq!(photo.resources.iter().find(|resource| resource.name == "Background worker").unwrap().wait_for_url.as_deref(), Some("http://localhost:3300"));
         assert_eq!(photo.resources.iter().find(|resource| resource.kind == "url").unwrap().wait_for_url.as_deref(), Some("http://localhost:3300"));
