@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{Local, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,7 +13,12 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tauri::{Emitter, Manager, State};
+use tauri::{
+    menu::{Menu, MenuItem, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+    AppHandle, Emitter, Manager, State, WindowEvent,
+};
+use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -139,6 +144,7 @@ struct RestoreProgress {
 struct AppState {
     db_path: PathBuf,
     cancelled_restores: Mutex<HashSet<String>>,
+    restore_lock: Mutex<()>,
 }
 
 fn initialise_database(path: &Path) -> Result<(), String> {
@@ -326,7 +332,7 @@ fn emit_progress(app: &tauri::AppHandle, operation_id: &str, phase: &str, item: 
     let _ = app.emit("stage://restore-progress", RestoreProgress { operation_id: operation_id.into(), phase: phase.into(), item, message: message.into() });
 }
 
-fn restore_cancelled(state: &State<AppState>, operation_id: &str) -> bool {
+fn restore_cancelled(state: &AppState, operation_id: &str) -> bool {
     state.cancelled_restores.lock().map(|items| items.contains(operation_id)).unwrap_or(false)
 }
 
@@ -512,18 +518,16 @@ fn application_directories() -> Vec<PathBuf> {
     paths
 }
 
-#[tauri::command]
-fn list_stages(state: State<AppState>) -> Result<Vec<StageDefinition>, String> {
-    let connection = Connection::open(&state.db_path).map_err(|error| error.to_string())?;
+fn load_stages(path: &Path) -> Result<Vec<StageDefinition>, String> {
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
     let mut statement = connection.prepare("SELECT document FROM stages ORDER BY updated_at DESC").map_err(|error| error.to_string())?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0)).map_err(|error| error.to_string())?;
     rows.map(|row| row.map_err(|error| error.to_string()).and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))).collect()
 }
 
-#[tauri::command]
-fn save_stage(stage: StageDefinition, state: State<AppState>) -> Result<(), String> {
-    let document = serde_json::to_string(&stage).map_err(|error| error.to_string())?;
-    let connection = Connection::open(&state.db_path).map_err(|error| error.to_string())?;
+fn store_stage(path: &Path, stage: &StageDefinition) -> Result<(), String> {
+    let document = serde_json::to_string(stage).map_err(|error| error.to_string())?;
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection.execute(
         "INSERT INTO stages (id,name,updated_at,document) VALUES (?1,?2,?3,?4)
          ON CONFLICT(id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at, document=excluded.document",
@@ -531,10 +535,69 @@ fn save_stage(stage: StageDefinition, state: State<AppState>) -> Result<(), Stri
     ).map(|_| ()).map_err(|error| error.to_string())
 }
 
-#[tauri::command]
-fn delete_stage(id: String, state: State<AppState>) -> Result<(), String> {
-    let connection = Connection::open(&state.db_path).map_err(|error| error.to_string())?;
+fn stored_stage_name(path: &Path, id: &str) -> Result<Option<String>, String> {
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
+    match connection.query_row("SELECT name FROM stages WHERE id = ?1", [id], |row| row.get(0)) {
+        Ok(name) => Ok(Some(name)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn remove_stage(path: &Path, id: &str) -> Result<(), String> {
+    let connection = Connection::open(path).map_err(|error| error.to_string())?;
     connection.execute("DELETE FROM stages WHERE id = ?1", [id]).map(|_| ()).map_err(|error| error.to_string())
+}
+
+fn build_tray_menu(app: &AppHandle, db_path: &Path) -> Result<Menu<tauri::Wry>, String> {
+    let menu = Menu::new(app).map_err(|error| error.to_string())?;
+    let heading = MenuItem::with_id(app, "stage-heading", "Open a stage", false, None::<&str>).map_err(|error| error.to_string())?;
+    menu.append(&heading).map_err(|error| error.to_string())?;
+    let mut stages = load_stages(db_path)?;
+    stages.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    if stages.is_empty() {
+        let empty = MenuItem::with_id(app, "stage-empty", "No saved stages", false, None::<&str>).map_err(|error| error.to_string())?;
+        menu.append(&empty).map_err(|error| error.to_string())?;
+    } else {
+        for stage in stages {
+            let item = MenuItem::with_id(app, format!("restore:{}", stage.id), stage.name, true, None::<&str>).map_err(|error| error.to_string())?;
+            menu.append(&item).map_err(|error| error.to_string())?;
+        }
+    }
+    menu.append(&PredefinedMenuItem::separator(app).map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;
+    let capture = MenuItem::with_id(app, "capture", "Save current setup", true, None::<&str>).map_err(|error| error.to_string())?;
+    let show = MenuItem::with_id(app, "show", "Show Stage", true, None::<&str>).map_err(|error| error.to_string())?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Stage", true, None::<&str>).map_err(|error| error.to_string())?;
+    menu.append(&capture).map_err(|error| error.to_string())?;
+    menu.append(&show).map_err(|error| error.to_string())?;
+    menu.append(&quit).map_err(|error| error.to_string())?;
+    Ok(menu)
+}
+
+fn refresh_tray_menu(app: &AppHandle, db_path: &Path) -> Result<(), String> {
+    let menu = build_tray_menu(app, db_path)?;
+    let tray = app.tray_by_id("stage-tray").ok_or("Stage tray icon is unavailable")?;
+    tray.set_menu(Some(menu)).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn list_stages(state: State<AppState>) -> Result<Vec<StageDefinition>, String> {
+    load_stages(&state.db_path)
+}
+
+#[tauri::command]
+fn save_stage(stage: StageDefinition, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    let refresh_menu = stored_stage_name(&state.db_path, &stage.id)?.as_deref() != Some(stage.name.as_str());
+    store_stage(&state.db_path, &stage)?;
+    if refresh_menu { let _ = refresh_tray_menu(&app, &state.db_path); }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_stage(id: String, app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    remove_stage(&state.db_path, &id)?;
+    let _ = refresh_tray_menu(&app, &state.db_path);
+    Ok(())
 }
 
 fn read_installed_apps() -> Vec<InstalledApp> {
@@ -737,12 +800,12 @@ fn system_snapshot() -> Result<SystemSnapshot, String> {
     }
 }
 
-#[tauri::command]
-fn capture_current() -> Result<StageDefinition, String> {
+fn capture_current_definition() -> Result<StageDefinition, String> {
     let (windows, _, _) = read_hypr_windows()?;
     let applications = read_installed_apps();
     let now = Utc::now().to_rfc3339();
-    let resources = windows.into_iter().map(|window| {
+    let stage_pid = std::process::id() as i64;
+    let resources = windows.into_iter().filter(|window| window.pid != stage_pid && window.class_name.to_lowercase() != "stage").map(|window| {
         let lower_class = window.class_name.to_lowercase();
         let kind = if ["kitty", "alacritty", "foot", "wezterm", "konsole"].iter().any(|terminal| lower_class.contains(terminal)) { "terminal" } else { "app" };
         let application = (kind == "app").then(|| applications.iter().find(|application| {
@@ -768,6 +831,9 @@ fn capture_current() -> Result<StageDefinition, String> {
     }).collect();
     Ok(StageDefinition { id: Uuid::new_v4().to_string(), name: "Captured setup".into(), description: "Draft captured from open Hyprland windows — review launch details before saving.".into(), color: "#82d8ff".into(), notes: "Stage deliberately did not capture command arguments or browser URLs.".into(), clear_workspaces: false, focus_workspace: 1, created_at: now.clone(), updated_at: now, resources })
 }
+
+#[tauri::command]
+fn capture_current() -> Result<StageDefinition, String> { capture_current_definition() }
 
 #[tauri::command]
 fn cancel_restore(operation_id: String, state: State<AppState>) -> Result<(), String> {
@@ -798,8 +864,8 @@ fn close_stage(stage: StageDefinition) -> Result<usize, String> {
     if errors.is_empty() { Ok(closed) } else { Err(format!("Closed {closed} windows; {}", errors.join("; "))) }
 }
 
-#[tauri::command]
-fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHandle, state: State<AppState>) -> Result<RestoreRun, String> {
+fn restore_stage_inner(operation_id: String, stage: StageDefinition, app: AppHandle, state: &AppState) -> Result<RestoreRun, String> {
+    let _restore_guard = state.restore_lock.try_lock().map_err(|_| "Another Stage restoration is already running".to_string())?;
     let started = Instant::now();
     let started_at = Utc::now().to_rfc3339();
     state.cancelled_restores.lock().map_err(|_| "Restoration state is unavailable".to_string())?.remove(&operation_id);
@@ -817,7 +883,7 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
     let mut items = Vec::new();
 
     for resource in &stage.resources {
-        if restore_cancelled(&state, &operation_id) { break; }
+        if restore_cancelled(state, &operation_id) { break; }
         if resource.kind == "note" {
             let item = RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "skipped".into(), message: "Resumption note is available in Stage".into() };
             emit_progress(&app, &operation_id, "placing", Some(item.clone()), format!("Handled {}", resource.name));
@@ -838,12 +904,12 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
         if let Some(url) = resource.wait_for_url.as_deref() {
             emit_progress(&app, &operation_id, "waiting", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "launched".into(), message: format!("Waiting for {url} before launch") }), format!("Waiting before launching {}", resource.name));
             let result = if let Some(cached) = readiness.get(url) { cached.clone() } else {
-                let checked = wait_until_ready(url, Duration::from_secs(45), || restore_cancelled(&state, &operation_id));
+                let checked = wait_until_ready(url, Duration::from_secs(45), || restore_cancelled(state, &operation_id));
                 readiness.insert(url.into(), checked.clone());
                 checked
             };
             if let Err(error) = result {
-                if restore_cancelled(&state, &operation_id) { break; }
+                if restore_cancelled(state, &operation_id) { break; }
                 let item = RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: "failed".into(), message: error };
                 emit_progress(&app, &operation_id, "waiting", Some(item.clone()), format!("Dependency for {} was not ready", resource.name));
                 items.push(item);
@@ -867,7 +933,7 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
             }
             let deadline = Instant::now() + Duration::from_secs(12);
             let mut found = None;
-            while !restore_cancelled(&state, &operation_id) && Instant::now() < deadline {
+            while !restore_cancelled(state, &operation_id) && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(250));
                 let Ok((latest, _, _)) = read_hypr_windows() else { continue; };
                 let eligible: Vec<HyprWindow> = if resource.kind == "url" && resource.match_title.trim().is_empty() {
@@ -878,7 +944,7 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
             (found, false)
         };
 
-        if restore_cancelled(&state, &operation_id) { break; }
+        if restore_cancelled(state, &operation_id) { break; }
         let item = if let Some(window) = matched {
             used.insert(window.address.clone());
             emit_progress(&app, &operation_id, "placing", Some(RestoreItem { resource_id: resource.id.clone(), name: resource.name.clone(), status: if reused { "reused".into() } else { "launched".into() }, message: format!("Moving to workspace {}", resource.placement.workspace) }), format!("Placing {}", resource.name));
@@ -893,7 +959,7 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
         items.push(item);
     }
 
-    let was_cancelled = restore_cancelled(&state, &operation_id);
+    let was_cancelled = restore_cancelled(state, &operation_id);
     if was_cancelled {
         let handled: HashSet<String> = items.iter().map(|item| item.resource_id.clone()).collect();
         for resource in stage.resources.iter().filter(|resource| !handled.contains(&resource.id)) {
@@ -914,6 +980,11 @@ fn restore_stage(operation_id: String, stage: StageDefinition, app: tauri::AppHa
 }
 
 #[tauri::command]
+fn restore_stage(operation_id: String, stage: StageDefinition, app: AppHandle, state: State<AppState>) -> Result<RestoreRun, String> {
+    restore_stage_inner(operation_id, stage, app, &state)
+}
+
+#[tauri::command]
 fn list_runs(state: State<AppState>) -> Result<Vec<RestoreRun>, String> {
     let connection = Connection::open(&state.db_path).map_err(|error| error.to_string())?;
     let mut statement = connection.prepare("SELECT document FROM restore_runs ORDER BY started_at DESC LIMIT 100").map_err(|error| error.to_string())?;
@@ -921,16 +992,105 @@ fn list_runs(state: State<AppState>) -> Result<Vec<RestoreRun>, String> {
     rows.map(|row| row.map_err(|error| error.to_string()).and_then(|json| serde_json::from_str(&json).map_err(|error| error.to_string()))).collect()
 }
 
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    let _ = app.notification().builder().title(title).body(body).show();
+}
+
+fn capture_from_tray(app: AppHandle) {
+    thread::spawn(move || {
+        let result = (|| -> Result<(String, usize), String> {
+            let state = app.state::<AppState>();
+            let mut stage = capture_current_definition()?;
+            stage.name = format!("Saved setup · {}", Local::now().format("%Y-%m-%d %H:%M"));
+            stage.description = "Captured from the Stage tray".into();
+            stage.notes = "Captured from the system tray. Review terminal commands and URLs before relying on relaunch.".into();
+            let count = stage.resources.len();
+            let name = stage.name.clone();
+            store_stage(&state.db_path, &stage)?;
+            refresh_tray_menu(&app, &state.db_path)?;
+            let _ = app.emit("stage://stages-changed", ());
+            Ok((name, count))
+        })();
+        match result {
+            Ok((name, count)) => notify(&app, "Stage saved", &format!("{name} captured {count} window{}.", if count == 1 { "" } else { "s" })),
+            Err(error) => notify(&app, "Could not save Stage", &error),
+        }
+    });
+}
+
+fn restore_from_tray(app: AppHandle, stage_id: String) {
+    thread::spawn(move || {
+        let stage = {
+            let state = app.state::<AppState>();
+            load_stages(&state.db_path).and_then(|stages| stages.into_iter().find(|stage| stage.id == stage_id).ok_or_else(|| "The selected Stage no longer exists".into()))
+        };
+        let result = stage.and_then(|stage| {
+            notify(&app, "Restoring Stage", &stage.name);
+            let state = app.state::<AppState>();
+            restore_stage_inner(Uuid::new_v4().to_string(), stage, app.clone(), &state)
+        });
+        match result {
+            Ok(run) => {
+                let failed = run.items.iter().filter(|item| item.status == "failed").count();
+                let body = if failed == 0 { format!("{} is ready.", run.stage_name) } else { format!("{} finished with {failed} failed resource{}.", run.stage_name, if failed == 1 { "" } else { "s" }) };
+                notify(&app, "Stage restoration finished", &body);
+            }
+            Err(error) => notify(&app, "Could not restore Stage", &error),
+        }
+    });
+}
+
+fn handle_tray_menu(app: &AppHandle, item_id: &str) {
+    match item_id {
+        "capture" => capture_from_tray(app.clone()),
+        "show" => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        "quit" => app.exit(0),
+        id if id.starts_with("restore:") => restore_from_tray(app.clone(), id.trim_start_matches("restore:").to_owned()),
+        _ => {}
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let start_hidden = env::args_os().any(|argument| argument == "--background");
     tauri::Builder::default()
-        .setup(|app| {
+        .plugin(tauri_plugin_single_instance::init(|app, arguments, _working_directory| {
+            if !arguments.iter().any(|argument| argument == "--background") {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+        }))
+        .plugin(tauri_plugin_notification::init())
+        .setup(move |app| {
             let data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&data_dir)?;
             let db_path = data_dir.join("stage.sqlite3");
             initialise_database(&db_path).map_err(std::io::Error::other)?;
-            app.manage(AppState { db_path, cancelled_restores: Mutex::new(HashSet::new()) });
+            app.manage(AppState { db_path: db_path.clone(), cancelled_restores: Mutex::new(HashSet::new()), restore_lock: Mutex::new(()) });
+            let menu = build_tray_menu(app.handle(), &db_path).map_err(std::io::Error::other)?;
+            let mut tray = TrayIconBuilder::with_id("stage-tray").menu(&menu).show_menu_on_left_click(true).tooltip("Stage workspaces");
+            if let Some(icon) = app.default_window_icon() { tray = tray.icon(icon.clone()); }
+            tray.on_menu_event(|app, event| handle_tray_menu(app, event.id.as_ref())).build(app)?;
+            if !start_hidden {
+                if let Some(window) = app.get_webview_window("main") {
+                    window.show()?;
+                    window.set_focus()?;
+                }
+            }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .invoke_handler(tauri::generate_handler![list_stages, save_stage, delete_stage, discover_apps, discover_development_stages, system_snapshot, capture_current, restore_stage, cancel_restore, close_stage, list_runs])
         .run(tauri::generate_context!())

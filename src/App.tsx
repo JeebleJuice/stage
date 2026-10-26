@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AppWindow, Archive, ArrowLeft, Check, ChevronRight, CircleAlert, CircleDot, Copy, Download, ExternalLink, File, Folder, History, LayoutDashboard, Link2, ListRestart, Monitor, MoreHorizontal, PanelLeft, Pencil, Pin, Plus, RefreshCw, Search, Settings, Sparkles, SquareTerminal, Trash2, Upload, Waypoints, X } from "lucide-react";
-import { cancelRestore, captureCurrent, closeStage, deleteStage, discoverApps, discoverDevelopmentStages, getSnapshot, listRuns, listStages, onRestoreProgress, restoreStage, saveStage } from "./bridge";
+import { cancelRestore, captureCurrent, closeStage, deleteStage, discoverApps, discoverDevelopmentStages, getSnapshot, listRuns, listStages, onRestoreProgress, onStagesChanged, restoreStage, saveStage } from "./bridge";
 import { sampleStages } from "./data";
 import type { InstalledApp, ResourceKind, RestoreItem, RestoreRun, StageDefinition, StageResource, SystemSnapshot, WindowMode } from "./types";
 
@@ -122,6 +122,7 @@ export default function App() {
 
   useEffect(() => { Promise.all([listStages(sampleStages), getSnapshot(), discoverApps(), listRuns(), discoverDevelopmentStages()]).then(([saved, system, foundApps, history, generated]) => { const reconciled = reconcileDevelopmentStages(saved.length ? saved : [], generated); setStages(reconciled.stages.length ? reconciled.stages : sampleStages); void Promise.all(reconciled.changed.map(saveStage)).catch((error) => setNotice(String(error))); setSnapshot(system); setApps(foundApps); setRuns(history); }).catch((error) => setNotice(String(error))); }, []);
   useEffect(() => () => restoreListener.current(), []);
+  useEffect(() => { let unlisten: () => void = () => undefined; void onStagesChanged(() => { void listStages(sampleStages).then(setStages).catch((error) => setNotice(String(error))); }).then((stop) => { unlisten = stop; }); return () => unlisten(); }, []);
 
   const persist = (stage: StageDefinition) => { const next = { ...stage, updatedAt: new Date().toISOString() }; setStages((all) => all.map((item) => item.id === next.id ? next : item)); void saveStage(next).catch((error) => setNotice(String(error))); };
   const createStage = () => { const now = new Date().toISOString(); const stage: StageDefinition = { id: crypto.randomUUID(), name: "Untitled stage", description: "A new persistent workspace", color: colors[stages.length % colors.length], notes: "", clearWorkspaces: false, focusWorkspace: 1, createdAt: now, updatedAt: now, resources: [] }; setStages((all) => [...all, stage]); setActiveId(stage.id); void saveStage(stage); };

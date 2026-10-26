@@ -74,6 +74,11 @@ export async function onRestoreProgress(handler: (progress: RestoreProgress) => 
   return listen<RestoreProgress>("stage://restore-progress", (event) => handler(event.payload));
 }
 
+export async function onStagesChanged(handler: () => void): Promise<UnlistenFn> {
+  if (!isTauri()) return () => undefined;
+  return listen("stage://stages-changed", handler);
+}
+
 export async function listRuns(): Promise<RestoreRun[]> {
   if (isTauri()) return invoke("list_runs");
   return readLocal(RUN_KEY, []);

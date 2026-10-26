@@ -15,6 +15,7 @@ The project follows the product definition in `Stage - Persistent Hyprland Works
 - Reuse matching open windows before launching missing resources.
 - Place windows through Hyprland dispatchers, including workspace, monitor, tiled/floating/fullscreen, pinned state, and optional floating geometry.
 - Close every application window on a Stage's declared workspaces in one confirmed action, while keeping Stage itself open.
+- Run continuously in the Waybar system tray. The tray menu restores any saved Stage directly, captures the current desktop as a new Stage, opens the editor, or quits the background service.
 - Stream per-resource restoration progress, support cancellation, and report each reused, launched, placed, skipped, timed-out, or failed resource.
 - Run the UI in a browser with a safe simulated adapter for interface development.
 
